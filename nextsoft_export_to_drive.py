@@ -1,13 +1,12 @@
-
 # nextsoft_export_to_drive.py
 # Fluxo:
-# 1) Login
-# 2) Troca de loja (ex.: GOIANIA - TEA SHOP FLAMBOYANT)
-# 3) Navega: Vendas > Vendedor Analítico
-# 4) Abre filtros (estabiliza a tela)
-# 5) Tenta capturar URL do Excel; se não captar (blob:/POST), faz FALLBACK:
-#    chama a API de dados com dataInicial/dataFinal desejadas e gera o Excel localmente.
-# 6) Envia ao Google Drive via rclone
+# 1) Login (resiliente: retries, timeouts maiores, user-agent real)
+# 2) Troca de loja (via secret APPNEXT_LOJA_DESTINO)
+# 3) Vendas > Vendedor Analítico
+# 4) Abre filtros (estabiliza grid)
+# 5) Tenta exportar; se URL direta não for capturada (blob/POST), FALLBACK:
+#    refaz a chamada de dados com dataInicial/dataFinal desejadas e gera o Excel localmente
+# 6) Envia o arquivo ao Google Drive via rclone
 
 import os, sys, subprocess, traceback, shutil, json, unicodedata, re
 from pathlib import Path
@@ -36,30 +35,26 @@ DRIVE_REMOTE    = os.getenv("DRIVE_REMOTE", "GDRIVE:")
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip()
 DRIVE_FILE_NAME = os.getenv("DRIVE_FILE_NAME", "importacaoA.xlsx").strip()
 
-# Datas desejadas (formato BR). Ex.: 01/06/2025 e 21/08/2025
 DATA_INICIO = os.getenv("DATA_INICIO", "01/06/2025").strip()
 DATA_FIM    = os.getenv("DATA_FIM", "").strip()  # vazio => hoje 23:59:59
 
-# Template e linha do cabeçalho no template (1 = primeira linha).
-# Seu arquivo tem uma linha de título acima do cabeçalho, então o default 2 funciona.
 TEMPLATE_XLSX = os.getenv("TEMPLATE_XLSX", "importacaoA.xlsx")
 TEMPLATE_HEADER_ROW = int(os.getenv("TEMPLATE_HEADER_ROW", "2"))
 
-# Opcional: forçar lojaId diretamente no fallback (se UI falhar)
+# Forçar lojaId diretamente no fallback (se quiser)
 LOJA_ID_DESTINO = os.getenv("APPNEXT_LOJA_ID_DESTINO", "").strip()
 
 RCLONE_PATH = os.getenv("RCLONE_PATH") or shutil.which("rclone") or r"C:\rclone\rclone.exe"
 if not Path(RCLONE_PATH).exists() and shutil.which("rclone") is None:
-    log("ERRO: rclone não encontrado. Ajuste RCLONE_PATH no .env ou adicione ao PATH.")
+    log("ERRO: rclone não encontrado. Ajuste RCLONE_PATH ou adicione ao PATH.")
     sys.exit(1)
 
 if not (REDE and USER and PASS):
-    log("ERRO: Preencha APPNEXT_REDE / APPNEXT_USER / APPNEXT_PASS no .env")
+    log("ERRO: Preencha APPNEXT_REDE / APPNEXT_USER / APPNEXT_PASS")
     sys.exit(1)
 
 TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 LOCAL_OUT = Path.cwd() / f"export_nextsoft_{TS}.xlsx"
-
 LOGIN_URL = "https://www.appnext.com.br/#/login"
 
 # -------- datas ----------
@@ -76,7 +71,7 @@ if not DATA_FIM:
 INI_DT = to_dt(DATA_INICIO) or datetime(2025, 6, 1)
 FIM_DT = to_dt(DATA_FIM, end=True) or datetime.now().replace(hour=23, minute=59, second=59)
 
-# Padrão ISO com Z (igual ao DevTools)
+# ISO com Z (mesmo padrão visto no DevTools)
 FMT_JSON_INI = INI_DT.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 FMT_JSON_FIM = FIM_DT.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 FMT_BR_INI   = INI_DT.strftime("%d/%m/%Y, %H:%M:%S")
@@ -97,12 +92,10 @@ SEL = {
     # tela alvo
     "titulo_rel": "text=Listagem de Vendedor Analítico",
 
-    # filtros
+    # filtros / grid / export
     "btn_filtros": "[title*='Filtro'], [aria-label*='Filtro'], button:has(i.mdi-filter), button:has(i.fa-filter), button:has-text('Filtros')",
     "pane_filtros": "#filtrosForm",
     "btn_atualizar": "button:has-text('Atualizar Filtros')",
-
-    # grid / export
     "grid_row": "table tbody tr",
     "excel_btn": "#dataTableButtons button.buttons-excel, button.buttons-excel",
 }
@@ -122,7 +115,7 @@ def rclone_copy_latest(local_file: Path):
         print(res.stderr, file=sys.stderr)
         raise RuntimeError("Falha ao atualizar o arquivo no Drive.")
 
-def _click_first(page, selectors: list[str]) -> bool:
+def _click_first(page, selectors):
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -155,14 +148,14 @@ def goto_vendedor_analitico_via_menu(page):
                 break
         except Exception:
             continue
-    # confirma rota
+    # confirma rota/título
     try:
-        page.wait_for_url("**/loja/vendas/**vendedor**", timeout=20000)
+        page.wait_for_url("**/loja/vendas/**vendedor**", timeout=30000)
     except PWTimeout:
-        page.wait_for_selector(SEL["titulo_rel"], timeout=15000)
+        page.wait_for_selector(SEL["titulo_rel"], timeout=20000)
 
 def open_filters_pane(page):
-    # se já aberto, retorna
+    # se já estiver aberto, retorna
     try:
         page.wait_for_selector(f"{SEL['pane_filtros']}.show", timeout=1500)
         return
@@ -174,7 +167,7 @@ def open_filters_pane(page):
             loc = page.locator(sel).first
             if loc.count():
                 loc.scroll_into_view_if_needed(timeout=1500)
-                loc.click(timeout=1500, force=True)
+                loc.click(timeout=2000, force=True)
                 break
         except Exception:
             continue
@@ -182,7 +175,7 @@ def open_filters_pane(page):
     try:
         page.wait_for_selector(f"{SEL['pane_filtros']}.show", timeout=4000)
     except Exception:
-        # força via JS
+        # força abrir (caso offcanvas)
         page.evaluate("""idSel => { const p=document.querySelector(idSel); if(p){p.classList.add('show'); p.style.display='block';} }""",
                       SEL["pane_filtros"])
 
@@ -238,26 +231,16 @@ def hook_export_capture(page):
 def replay_export_with_dates(page, destino_path: Path):
     if not CapturedExport.url:
         raise RuntimeError("URL de exportação não foi capturada. Clique 1x no botão Excel para eu aprender a URL.")
-
     parsed = urlparse(CapturedExport.url)
     qs = parse_qs(parsed.query)
     qs["dataInicial"] = [FMT_JSON_INI]
     qs["dataFinal"]   = [FMT_JSON_FIM]
     target_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(qs, doseq=True)}"
-
     log(f"[export-replay] GET -> {target_url}")
-
     with page.expect_download(timeout=180000) as dl:
         page.evaluate("""
-            (url) => {
-                const a = document.createElement('a');
-                a.href = url;
-                a.rel = 'noopener';
-                a.target = '_blank';
-                document.body.appendChild(a);
-                a.click();
-                setTimeout(()=>a.remove(), 500);
-            }
+            (url) => { const a=document.createElement('a'); a.href=url; a.target='_blank';
+                       document.body.appendChild(a); a.click(); setTimeout(()=>a.remove(),500); }
         """, target_url)
     download = dl.value
     download.save_as(destino_path.as_posix())
@@ -265,28 +248,17 @@ def replay_export_with_dates(page, destino_path: Path):
 
 # --------- FALLBACK: baixar JSON e gerar Excel ----------
 def fetch_report_json_with_dates(page):
-    """
-    Usa o endpoint de DADOS capturado (vendas-vendedor-analitico) e refaz a chamada
-    com dataInicial/dataFinal desejadas. Retorna o JSON (list/obj).
-    Pode forçar a loja via APPNEXT_LOJA_ID_DESTINO.
-    """
     if not Captured.filtro_url:
         raise RuntimeError("Endpoint de dados não capturado ainda.")
-
     parsed = urlparse(Captured.filtro_url)
     qs = parse_qs(parsed.query)
     qs["dataInicial"] = [FMT_JSON_INI]
     qs["dataFinal"]   = [FMT_JSON_FIM]
-
-    # Se você souber o ID da loja de Goiânia, pode forçar por .env
     if LOJA_ID_DESTINO:
         qs["lojaId"] = [LOJA_ID_DESTINO]
-
     target_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(qs, doseq=True)}"
-
     headers = {**_clean_headers(Captured.filtro_headers or {})}
     log(f"[dados-replay] GET -> {target_url}")
-
     js_code = """
     async ([url, headers]) => {
         const res = await fetch(url, { method: "GET", headers });
@@ -297,66 +269,49 @@ def fetch_report_json_with_dates(page):
     result = page.evaluate(js_code, [target_url, headers])
     if not result.get("ok"):
         raise RuntimeError(f"Falha ao obter dados: HTTP {result.get('status')}")
-
     try:
         data = json.loads(result["text"])
     except Exception as e:
         raise RuntimeError(f"Não consegui decodificar o JSON da API: {e}") from e
     return data
 
-# ----------------- Normalização, Aliases, Datas -----------------
+# ----------------- Normalização/Excel -----------------
 MAPEAMENTO_COLUNAS = {
-    # datas
-    "dataVenda":                  "Data",
-
-    # identificação do cupom / quantidade
-    "numeroCupom":                "Número Cupom",
-    "qtdItens":                   "Qtd. Itens no Cupom",
-    "quantidade":                 "Qtd. Itens no Cupom",
-
-    # produto / grupos
-    "produto.nome":               "Descrição",
-    "produto":                    "Descrição",
-    "item.descricao":             "Descrição",
-
-    "subGrupo.nome":              "Sub-Grupo",
-    "subgrupo.nome":              "Sub-Grupo",
-    "subGrupo":                   "Sub-Grupo",
-    "subgrupo":                   "Sub-Grupo",
-
-    # valores
-    "valorUnitario":              "Valor Unitário",
-    "precoUnitario":              "Valor Unitário",
-
-    "valorTotal":                 "Valor Total",
-    "totalItem":                  "Valor Total",
-    "valorLiquido":               "Valor Total",
+    "dataVenda": "Data",
+    "numeroCupom": "Número Cupom",
+    "qtdItens": "Qtd. Itens no Cupom",
+    "quantidade": "Qtd. Itens no Cupom",
+    "produto.nome": "Descrição",
+    "produto": "Descrição",
+    "item.descricao": "Descrição",
+    "subGrupo.nome": "Sub-Grupo",
+    "subgrupo.nome": "Sub-Grupo",
+    "subGrupo": "Sub-Grupo",
+    "subgrupo": "Sub-Grupo",
+    "valorUnitario": "Valor Unitário",
+    "precoUnitario": "Valor Unitário",
+    "valorTotal": "Valor Total",
+    "totalItem": "Valor Total",
+    "valorLiquido": "Valor Total",
 }
-
 TEMPLATE_ALIASES = {
-    "data":                ["dataVenda", "data", "dataHora", "createdAt", "dt_venda"],
-    "numero cupom":        ["numeroCupom", "cupom.numero", "numero", "documento", "numeroDocumento"],
-    "qtd itens no cupom":  ["qtdItens", "quantidade", "qtde", "qtd", "itens", "itensQuantidade"],
-    "descricao":           ["descricao", "produto", "produto.descricao", "produtoNome", "item.descricao"],
-    "sub-grupo":           ["subGrupo", "subgrupo", "subGrupo.nome", "subgrupo.nome"],
-    "valor unitario":      ["valorUnitario", "precoUnitario", "valor.unitario", "preco"],
-    "valor total":         ["valorTotal", "valor.total", "total", "totalItem", "valorLiquido"],
-    "vendedor":            ["vendedor.nome", "vendedor", "vendedorNome", "colaborador", "usuario"],
-    "grupo":               ["grupo.nome", "grupo", "nomeGrupo"],
+    "data": ["dataVenda","data","dataHora","createdAt","dt_venda"],
+    "numero cupom": ["numeroCupom","cupom.numero","numero","documento","numeroDocumento"],
+    "qtd itens no cupom": ["qtdItens","quantidade","qtde","qtd","itens","itensQuantidade"],
+    "descricao": ["descricao","produto","produto.descricao","produtoNome","item.descricao"],
+    "sub-grupo": ["subGrupo","subgrupo","subGrupo.nome","subgrupo.nome"],
+    "valor unitario": ["valorUnitario","precoUnitario","valor.unitario","preco"],
+    "valor total": ["valorTotal","valor.total","total","totalItem","valorLiquido"],
+    "vendedor": ["vendedor.nome","vendedor","vendedorNome","colaborador","usuario"],
+    "grupo": ["grupo.nome","grupo","nomeGrupo"],
 }
-
-DATE_HEADER_HINTS = {
-    "data", "data venda", "data de venda", "emissao", "data emissao", "data emissão",
-}
+DATE_HEADER_HINTS = {"data","data venda","data de venda","emissao","data emissao","data emissão"}
 
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    out = []
-    for ch in s:
-        out.append(ch if ch.isalnum() else " ")
-    return " ".join("".join(out).split())
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in s).split())
 
 def _is_iso_datetime_str(x: str) -> bool:
     if not isinstance(x, str): return False
@@ -383,196 +338,125 @@ def _load_template_headers(template_path: str) -> list[str]:
     df_t = pd.read_excel(template_path, nrows=0, header=TEMPLATE_HEADER_ROW-1, engine="openpyxl")
     return list(df_t.columns)
 
-def _build_dataframe_with_template(df, template_cols: list[str]) -> "pd.DataFrame":
+def _build_dataframe_with_template(df, template_cols: list[str]):
     import pandas as pd
-
-    # índice por nome normalizado das colunas do template e do DF
     norm_template = { _norm(c): c for c in template_cols }
     idx_df_norm = {}
     for c in df.columns:
         idx_df_norm.setdefault(_norm(str(c)), []).append(c)
-
-    # 1) mapeamentos manuais (MAPEAMENTO_COLUNAS)
     mapping = {}
-    for k_json, k_model in MAPEAMENTO_COLUNAS.items():
+    for k_json, k_model in MAPÉAMENTO_COLUNAS.items() if 'MAPÉAMENTO_COLUNAS' in globals() else MAPEAMENTO_COLUNAS.items():
         if k_json in df.columns and k_model in template_cols:
             mapping[k_json] = k_model
-
     usados_df = set(mapping.keys())
     usados_model = set(mapping.values())
-
-    # 2) aliases por nome do MODELO (TEMPLATE_ALIASES)
     for col_model in template_cols:
-        if col_model in usados_model:
-            continue
+        if col_model in usados_model: continue
         nmodel = _norm(col_model)
-        candidates = TEMPLATE_ALIASES.get(nmodel, [])
-        found = None
-        for cand in candidates:
-            if cand in df.columns:
-                found = cand
-                break
-            ncan = _norm(cand)
-            if ncan in idx_df_norm:
-                found = idx_df_norm[ncan][0]
-                break
-        if found and found not in usados_df:
-            mapping[found] = col_model
-            usados_df.add(found)
-            usados_model.add(col_model)
-
-    # 3) auto‑mapeamento por nome normalizado (exato/contém)
+        for cand in TEMPLATE_ALIASES.get(nmodel, []):
+            if cand in df.columns and cand not in usados_df:
+                mapping[cand] = col_model; usados_df.add(cand); usados_model.add(col_model); break
+            for alt in idx_df_norm.get(_norm(cand), []):
+                if alt not in usados_df:
+                    mapping[alt] = col_model; usados_df.add(alt); usados_model.add(col_model); break
+            if col_model in usados_model: break
     for c in df.columns:
-        if c in usados_df:
-            continue
+        if c in usados_df: continue
         nc = _norm(str(c))
         if nc in norm_template and norm_template[nc] not in usados_model:
-            mapping[c] = norm_template[nc]
-            usados_df.add(c)
-            usados_model.add(norm_template[nc])
-            continue
-        candidatos = [dst for nk, dst in norm_template.items() if nc and (nc in nk or nk in nc)]
-        for dst in candidatos:
+            mapping[c] = norm_template[nc]; usados_df.add(c); usados_model.add(norm_template[nc]); continue
+        for dst in [dst for nk, dst in norm_template.items() if nc and (nc in nk or nk in nc)]:
             if dst not in usados_model:
-                mapping[c] = dst
-                usados_df.add(c)
-                usados_model.add(dst)
-                break
-
-    # 4) monta DF final na ordem do template
+                mapping[c] = dst; usados_df.add(c); usados_model.add(dst); break
     out = pd.DataFrame()
     vazias = []
     for col_model in template_cols:
-        origem = None
-        for src, dst in mapping.items():
-            if dst == col_model:
-                origem = src
-                break
+        origem = next((src for src,dst in mapping.items() if dst==col_model), None)
         if origem is None and col_model in df.columns:
             origem = col_model
-
         if origem is not None:
             out[col_model] = df[origem]
         else:
-            out[col_model] = ""
-            vazias.append(col_model)
-
+            out[col_model] = ""; vazias.append(col_model)
     if vazias:
-        log(f"[mapeamento] Colunas do MODELO sem origem (ficaram vazias): {', '.join(vazias)}")
-
+        log(f"[mapeamento] Colunas do MODELO sem origem (vazias): {', '.join(vazias)}")
     return out
-
 
 def _apply_template_top_rows(out_path: Path):
     from openpyxl import load_workbook
-    if TEMPLATE_HEADER_ROW <= 1:
-        return
-
-    wb_out = load_workbook(out_path.as_posix())
-    ws_out = wb_out.active
-    wb_tpl = load_workbook(TEMPLATE_XLSX)
-    ws_tpl = wb_tpl.active
-
-    for _ in range(TEMPLATE_HEADER_ROW - 1):
-        ws_out.insert_rows(1)
-
+    if TEMPLATE_HEADER_ROW <= 1: return
+    wb_out = load_workbook(out_path.as_posix()); ws_out = wb_out.active
+    wb_tpl = load_workbook(TEMPLATE_XLSX); ws_tpl = wb_tpl.active
+    for _ in range(TEMPLATE_HEADER_ROW - 1): ws_out.insert_rows(1)
     for r in range(1, TEMPLATE_HEADER_ROW):
-        tpl_row = ws_tpl[r]
-        for c, cell in enumerate(tpl_row, start=1):
+        for c, cell in enumerate(ws_tpl[r], start=1):
             ws_out.cell(row=r, column=c, value=cell.value)
-
     for rng in ws_tpl.merged_cells.ranges:
         if rng.max_row <= (TEMPLATE_HEADER_ROW - 1):
             ws_out.merge_cells(start_row=rng.min_row, start_column=rng.min_col,
                                end_row=rng.max_row, end_column=rng.max_col)
-
     try:
         for key, dim in ws_tpl.column_dimensions.items():
-            if dim.width:
-                ws_out.column_dimensions[key].width = dim.width
-    except Exception:
-        pass
-
+            if dim.width: ws_out.column_dimensions[key].width = dim.width
+    except Exception: pass
     wb_out.save(out_path.as_posix())
 
 def write_excel_from_json(data, out_path: Path):
-    try:
-        import pandas as pd
-    except Exception:
-        raise RuntimeError("Precisa do pandas + openpyxl (pip install pandas openpyxl).")
-
-    if isinstance(data, list):
-        rows = data
+    import pandas as pd
+    if isinstance(data, list): rows = data
     elif isinstance(data, dict):
         rows = None
-        for key in ("items", "data", "resultado", "rows", "content"):
+        for key in ("items","data","resultado","rows","content"):
             if key in data and isinstance(data[key], list):
                 rows = data[key]; break
-        if rows is None:
-            rows = [data]
+        rows = rows or [data]
     else:
         rows = [{"raw": data}]
-
     df_raw = pd.json_normalize(rows)
     log("[debug] colunas do JSON normalizado: " + ", ".join(df_raw.columns.astype(str).tolist()))
-
     template_cols = _load_template_headers(TEMPLATE_XLSX)
     df_final = _build_dataframe_with_template(df_raw, template_cols)
     df_final = _format_date_columns(df_final)
-
     df_final.to_excel(out_path.as_posix(), index=False, engine="openpyxl")
     _apply_template_top_rows(out_path)
-
     log(f"Arquivo salvo com estrutura do modelo: {out_path.name}")
 
 # -------------- TROCAR LOJA --------------
-def trocar_loja(page, loja_nome=None): 
-     """
-     Tenta trocar a loja pelo menu superior.
-     Estratégia: procurar qualquer botão/área com 'TEA SHOP' ou nome da cidade e clicar.
-     Depois selecionar o item do menu pelo texto (aceita ponto final).
-     """
-     alvo = (loja_nome or os.getenv("APPNEXT_LOJA_DESTINO")
-             or "GOIANIA - TEA SHOP FLAMBOYANT")
-     alvo_regex = re.compile(rf"^{re.escape(alvo)}\.?$", re.IGNORECASE)
+# ================= def trocar_loja(page, loja_nome=None):
+# =================     alvo = (loja_nome or os.getenv("APPNEXT_LOJA_DESTINO") or "GOIANIA - TEA SHOP FLAMBOYANT")
+# =================     step(f"2) Trocando loja → {alvo}")
+# =================     try:
+# =================         opened = _click_first(page, [
+# =================             "button:has-text('TEA SHOP')",
+# =================             "[data-bs-toggle='dropdown']",
+# =================             ".dropdown-toggle",
+# =================         ])
+# =================         if not opened:
+# =================             _click_first(page, ["xpath=(//i[contains(@class,'store') or contains(@class,'shop')]/ancestor::*[self::button or self::a])[1]"])
+# =================         try:
+# =================             page.get_by_role("menuitem", name=re.compile(rf"^{re.escape(alvo)}\.?$", re.I)).first.click(timeout=6000, force=True)
+# =================         except Exception:
+# =================             if not _click_first(page, [f"text=^{re.escape(alvo)}$"]):
+# =================                raise RuntimeError("Não encontrei a opção da loja no dropdown.")
+# =================         log(f"Loja selecionada: {alvo}")
+# =================        try: page.wait_for_load_state("networkidle", timeout=12000)
+# =================         except Exception: pass
+# =================     except Exception as e:
+# =================         log(f"Falha ao trocar loja: {e}")
 
-     step(f"2) Trocando loja → {alvo}")
-     try:
-         opened = _click_first(page, [
-             "button:has-text('TEA SHOP')",
-             "button:has-text('VILA MADALENA')",
-             "button:has-text('FLAMBOYANT')",
-             "text=/S[ÂA]O PAULO - TEA SHOP|GOI[ÂA]NIA - TEA SHOP/i",
-             "[data-bs-toggle='dropdown']",
-             ".dropdown-toggle",
-            "xpath=(//*[contains(translate(normalize-space(.),'áãéíóúâêô','aaeiouaeo'),'TEA SHOP')])[1]",
-         ])
-         if not opened:
-            # último recurso: clicar em algo com ícone de loja (emoji/mdi) + caret
-             opened = _click_first(page, [
-                "xpath=(//i[contains(@class,'store') or contains(@class,'shop')]/ancestor::*[self::button or self::a])[1]"
-             ])
-
-         # Seleciona a opção pelo texto
-         try:
-            page.get_by_role("menuitem", name=alvo_regex).first.click(timeout=6000, force=True)
-         except Exception:
-             clicked = _click_first(page, [
-                 f"text=^{alvo}$",
-                 f"text=^{re.escape(alvo)}",
-                 f"xpath=//*[normalize-space()='{alvo}'] | //*[starts-with(normalize-space(), '{alvo}')]",
-             ])
-             if not clicked:
-                 raise RuntimeError("Não encontrei a opção da loja no dropdown.")
-
-         log(f"Loja selecionada: {alvo}")
-         try:
-             page.wait_for_load_state("networkidle", timeout=12000)
-         except Exception:
-             pass
-
-     except Exception as e:
-         log(f"Falha ao trocar loja: {e}")
+# -------- Navegação resiliente: goto com retries --------
+def goto_login_with_retries(page, url, tries=5):
+    alt_urls = {url, url.replace("https://www.", "https://")}
+    for i in range(1, tries+1):
+        for target in alt_urls:
+            try:
+                log(f"[goto] tentativa {i}/{tries} -> {target}")
+                page.goto(target, wait_until="load", timeout=240_000)
+                return
+            except Exception as e:
+                log(f"[goto] falhou em {target}: {e}")
+        page.wait_for_timeout(i * 5000)  # backoff progressivo
+    page.goto(url, wait_until="load", timeout=240_000)
 
 # ================ MAIN =================
 def main():
@@ -582,9 +466,11 @@ def main():
             headless=True,
             accept_downloads=True,
             viewport={"width": 1600, "height": 950},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
         )
         page = context.pages[0] if context.pages else context.new_page()
-        page.set_default_timeout(120000)
+        page.set_default_timeout(180_000)
+        page.set_default_navigation_timeout(300_000)
 
         page.on("console", lambda m: log(f"[console] {m.type}: {m.text}"))
         page.on("pageerror", lambda e: log(f"[pageerror] {e}"))
@@ -595,40 +481,39 @@ def main():
 
         try:
             step("1) Login")
-            page.goto(LOGIN_URL, wait_until="domcontentloaded")
+            goto_login_with_retries(page, LOGIN_URL)
 
             if "/#/login" in page.url:
                 page.fill(SEL["rede"], REDE)
                 page.fill(SEL["email"], USER)
                 page.fill(SEL["senha"], PASS)
                 page.click(SEL["entrar"])
-            page.wait_for_url("**/#/loja/**", timeout=60000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                pass
 
-            # >>> NOVO PASSO: TROCAR LOJA <<<
-# --------------            trocar_loja(page, "GOIANIA - TEA SHOP FLAMBOYANT")
+            page.wait_for_url("**/#/loja/**", timeout=120_000)
+            try: page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception: pass
 
+            # 2) Trocar loja via secret
+            trocar_loja(page, os.getenv("APPNEXT_LOJA_DESTINO"))
+
+            # 3) Ir para Vendas > Vendedor Analítico
             step("3) Menu: Vendas → Vendedor Analítico")
             goto_vendedor_analitico_via_menu(page)
-            page.wait_for_selector(SEL["titulo_rel"], timeout=30000)
+            page.wait_for_selector(SEL["titulo_rel"], timeout=40000)
             log("Tela confirmada.")
 
+            # 4) Abrir filtros e estabilizar grid
             step("4) Abrindo filtros")
             open_filters_pane(page)
-            try:
-                page.locator(SEL["btn_atualizar"]).first.click(timeout=3000)
-            except Exception:
-                pass
-            page.wait_for_selector(SEL["grid_row"], timeout=20000)
+            try: page.locator(SEL["btn_atualizar"]).first.click(timeout=3000)
+            except Exception: pass
+            page.wait_for_selector(SEL["grid_row"], timeout=30000)
 
-            # ================== EXPORTAÇÃO ==================
+            # 5) Export
             step("5) Exportar Excel (tentar capturar URL)")
             captured_export_ok = False
             try:
-                with page.expect_download(timeout=120000) as dl_tmp:
+                with page.expect_download(timeout=180000) as dl_tmp:
                     page.locator(SEL["excel_btn"]).first.click()
                 tmp_download = dl_tmp.value
                 tmp_path = Path.cwd() / f"_tmp_export_{TS}.xlsx"
@@ -651,8 +536,8 @@ def main():
                 step(f"5c) Fallback: baixando dados da API {FMT_BR_INI} → {FMT_BR_FIM} e gerando Excel")
                 data = fetch_report_json_with_dates(page)
                 write_excel_from_json(data, LOCAL_OUT)
-            # ================== /EXPORTAÇÃO ==================
 
+            # 6) Upload no Drive
             step("6) Enviando para Google Drive")
             rclone_copy_latest(LOCAL_OUT)
             log("Upload concluído.")
@@ -660,7 +545,6 @@ def main():
         except Exception:
             log("### ERRO DURANTE O FLUXO ###")
             print(traceback.format_exc())
-            # ================== input("Pressione Enter para fechar...")
         finally:
             try: context.close()
             except Exception: pass
